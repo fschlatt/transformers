@@ -16,7 +16,7 @@ from transformers.onnx import (
     validate_model_outputs,
 )
 from transformers.onnx.utils import compute_effective_axis_dimension, compute_serialized_parameters_size
-from transformers.testing_utils import require_onnx, require_tf, require_torch, require_vision, slow
+from transformers.testing_utils import require_onnx, require_rjieba, require_tf, require_torch, require_vision, slow
 
 
 if is_torch_available() or is_tf_available():
@@ -179,6 +179,7 @@ PYTORCH_EXPORT_MODELS = {
     ("distilbert", "distilbert-base-cased"),
     ("electra", "google/electra-base-generator"),
     ("roberta", "roberta-base"),
+    ("roformer", "junnyu/roformer_chinese_base"),
     ("xlm-roberta", "xlm-roberta-base"),
     ("layoutlm", "microsoft/layoutlm-base-uncased"),
     ("vit", "google/vit-base-patch16-224"),
@@ -286,6 +287,7 @@ class OnnxExportTestCaseV2(TestCase):
     @slow
     @require_torch
     @require_vision
+    @require_rjieba
     def test_pytorch_export(self, test_name, name, model_name, feature, onnx_config_class_constructor):
         self._onnx_export(test_name, name, model_name, feature, onnx_config_class_constructor)
 
