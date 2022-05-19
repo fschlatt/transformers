@@ -7,6 +7,7 @@ from ..models.bart import BartOnnxConfig
 from ..models.beit import BeitOnnxConfig
 from ..models.bert import BertOnnxConfig
 from ..models.big_bird import BigBirdOnnxConfig
+from ..models.bigbird_pegasus import BigBirdPegasusOnnxConfig
 from ..models.blenderbot import BlenderbotOnnxConfig
 from ..models.blenderbot_small import BlenderbotSmallOnnxConfig
 from ..models.camembert import CamembertOnnxConfig
@@ -24,6 +25,7 @@ from ..models.layoutlm import LayoutLMOnnxConfig
 from ..models.m2m_100 import M2M100OnnxConfig
 from ..models.marian import MarianOnnxConfig
 from ..models.mbart import MBartOnnxConfig
+from ..models.mobilebert import MobileBertOnnxConfig
 from ..models.roberta import RobertaOnnxConfig
 from ..models.roformer import RoFormerOnnxConfig
 from ..models.t5 import T5OnnxConfig
@@ -61,7 +63,8 @@ if is_tf_available():
     )
 if not is_torch_available() and not is_tf_available():
     logger.warning(
-        "The ONNX export features are only supported for PyTorch or TensorFlow. You will not be able to export models without one of these libraries installed."
+        "The ONNX export features are only supported for PyTorch or TensorFlow. You will not be able to export models"
+        " without one of these libraries installed."
     )
 
 
@@ -163,6 +166,17 @@ class FeaturesManager:
             "token-classification",
             "question-answering",
             onnx_config_cls=BigBirdOnnxConfig,
+        ),
+        "bigbird-pegasus": supported_features_mapping(
+            "default",
+            "default-with-past",
+            "causal-lm",
+            "causal-lm-with-past",
+            "seq2seq-lm",
+            "seq2seq-lm-with-past",
+            "sequence-classification",
+            "question-answering",
+            onnx_config_cls=BigBirdPegasusOnnxConfig,
         ),
         "blenderbot": supported_features_mapping(
             "default",
@@ -304,6 +318,15 @@ class FeaturesManager:
             "question-answering",
             onnx_config_cls=MBartOnnxConfig,
         ),
+        "mobilebert": supported_features_mapping(
+            "default",
+            "masked-lm",
+            "sequence-classification",
+            "multiple-choice",
+            "token-classification",
+            "question-answering",
+            onnx_config_cls=MobileBertOnnxConfig,
+        ),
         "m2m-100": supported_features_mapping(
             "default", "default-with-past", "seq2seq-lm", "seq2seq-lm-with-past", onnx_config_cls=M2M100OnnxConfig
         ),
@@ -415,8 +438,7 @@ class FeaturesManager:
             task_to_automodel = FeaturesManager._TASKS_TO_TF_AUTOMODELS
         if task not in task_to_automodel:
             raise KeyError(
-                f"Unknown task: {feature}. "
-                f"Possible values are {list(FeaturesManager._TASKS_TO_AUTOMODELS.values())}"
+                f"Unknown task: {feature}. Possible values are {list(FeaturesManager._TASKS_TO_AUTOMODELS.values())}"
             )
         return task_to_automodel[task]
 
@@ -469,8 +491,7 @@ class FeaturesManager:
         model_features = FeaturesManager.get_supported_features_for_model_type(model_type, model_name=model_name)
         if feature not in model_features:
             raise ValueError(
-                f"{model.config.model_type} doesn't support feature {feature}. "
-                f"Supported values are: {model_features}"
+                f"{model.config.model_type} doesn't support feature {feature}. Supported values are: {model_features}"
             )
 
         return model.config.model_type, FeaturesManager._SUPPORTED_MODEL_TYPE[model_type][feature]
