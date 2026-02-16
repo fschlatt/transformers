@@ -18,9 +18,10 @@ from __future__ import annotations
 import math
 import os
 import re
+import traceback
 from abc import abstractmethod
 from collections import defaultdict
-from collections.abc import Callable, MutableMapping, MutableSet
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from copy import deepcopy
@@ -33,13 +34,14 @@ import torch
 from .integrations.accelerate import get_device, offload_weight
 from .integrations.tensor_parallel import ALL_PARALLEL_STYLES
 from .utils import is_env_variable_true, logging
+from .utils.loading_report import LoadStateDictInfo
 
 
 _torch_distributed_available = torch.distributed.is_available()
 
 if TYPE_CHECKING:
     from .integrations.tensor_parallel import TensorParallelLayer
-    from .modeling_utils import PreTrainedModel
+    from .modeling_utils import LoadStateDictConfig, PreTrainedModel
     from .quantizers import HfQuantizer
 
 
@@ -64,7 +66,7 @@ def build_glob_alternation(
                 i += 1
                 body = src.replace("*", r".*")
                 branches.append(f"(?P<{group_name}>{body})")
-                tgt_group_to_glob[group_name] = glob.target_patterns[0]  # we index witht the first target
+                tgt_group_to_glob[group_name] = glob.target_patterns[0]  # we index with the first target
         else:
             group_name = f"g{i}"
             src_group_to_glob[group_name] = glob
@@ -440,7 +442,7 @@ class ErnieSplitAndDecoupleTextVisionExperts(ConversionOps):
 class Force16BytesAlignment(ConversionOps):
     """
     Ensures that the given tensor is 16-bytes aligned in memory and clones it if not.
-    This garantees 16-bytes alignmenet for kernels / implementations that use TMA or SIMD instructions like torch._grouped_mm.
+    This guarantees 16-bytes alignment for kernels / implementations that use TMA or SIMD instructions like torch._grouped_mm.
     """
 
     @torch.no_grad()
@@ -636,7 +638,7 @@ class WeightTransform:
             tensors = self.collected_tensors.pop(key)
             # Async loading
             if isinstance(tensors[0], Future):
-                tensors = [future.result() for future in tensors]
+                tensors = [future.result() for future in tensors if future.result() is not None]
             # Sync loading
             elif callable(tensors[0]):
                 tensors = [func() for func in tensors]
@@ -656,8 +658,7 @@ class WeightRenaming(WeightTransform):
         model=None,
         config=None,
         hf_quantizer=None,
-        missing_keys: MutableSet[str] | None = None,
-        conversion_errors: MutableMapping[str, str] | None = None,
+        loading_info: LoadStateDictInfo | None = None,
     ):
         # Collect the tensors here - we use a new dictionary to avoid keeping them in memory in the internal
         # attribute during the whole process
@@ -670,7 +671,7 @@ class WeightRenaming(WeightTransform):
 
         if hf_quantizer is not None and self.quantization_operation is not None:
             with log_conversion_errors(
-                layer_name, conversion_errors, (len(collected_tensors), layer_name), self.quantization_operation
+                layer_name, loading_info, (len(collected_tensors), layer_name), self.quantization_operation
             ):
                 collected_tensors = self.quantization_operation.convert(
                     collected_tensors,
@@ -679,10 +680,10 @@ class WeightRenaming(WeightTransform):
                     full_layer_name=target_key,
                     model=model,
                     config=config,
-                    missing_keys=missing_keys,
+                    missing_keys=loading_info.missing_keys if loading_info else None,
                 )
 
-        return collected_tensors, conversion_errors
+        return collected_tensors
 
 
 # List of classes that are known to be able to use m:n
@@ -713,24 +714,23 @@ class WeightConverter(WeightTransform):
         model=None,
         config=None,
         hf_quantizer=None,
-        missing_keys: MutableSet[str] | None = None,
-        conversion_errors: MutableMapping[str, str] | None = None,
+        loading_info: LoadStateDictInfo | None = None,
     ):
         # Collect the tensors here - we use a new dictionary to avoid keeping them in memory in the internal
         # attribute during the whole process
         collected_tensors = self.materialize_tensors()
 
         for op in self.operations:
-            with log_conversion_errors(layer_name, conversion_errors, (len(collected_tensors), layer_name), op):
+            with log_conversion_errors(layer_name, loading_info, (len(collected_tensors), layer_name), op):
                 collected_tensors = op.convert(
                     collected_tensors,
                     source_patterns=self.source_patterns,
                     target_patterns=self.target_patterns,
-                    # Additional kwargs, ususally not used
+                    # Additional kwargs, usually not used
                     full_layer_name=layer_name,
                     model=model,
                     config=config,
-                    missing_keys=missing_keys,
+                    missing_keys=loading_info.missing_keys if loading_info else None,
                 )
 
         # Tensors are returned from ops with the target patterns, we need to expand them to full name.
@@ -749,7 +749,7 @@ class WeightConverter(WeightTransform):
 
         if hf_quantizer is not None and self.quantization_operation is not None:
             with log_conversion_errors(
-                layer_name, conversion_errors, (len(collected_tensors), layer_name), self.quantization_operation
+                layer_name, loading_info, (len(collected_tensors), layer_name), self.quantization_operation
             ):
                 collected_tensors = self.quantization_operation.convert(
                     collected_tensors,
@@ -758,9 +758,9 @@ class WeightConverter(WeightTransform):
                     full_layer_name=layer_name,
                     config=config,
                     model=model,
-                    missing_keys=missing_keys,
+                    missing_keys=loading_info.missing_keys if loading_info else None,
                 )
-        return collected_tensors, conversion_errors
+        return collected_tensors
 
 
 # For I/O bound operations (i.e. here reading files), it is better to have fewer threads, e.g. 4 is a good default.
@@ -812,28 +812,33 @@ def spawn_tp_materialize(
 
 
 def dot_natural_key(s: str):
-    parts = s.split(".")
-    for i, p in enumerate(parts):
-        # whole-segment digits -> int; otherwise leave as str
+    """Sort key for state-dict names: split on ``"."`` and sort digits numerically
+    and strings alphabetically. We emit a tuple at each point to sort ints
+    first and strings second to avoid int-string comparison failures.
+    """
+    result = []
+    for p in s.split("."):
         if p.isdigit():
-            parts[i] = int(p)
-    return parts
+            result.append((0, int(p)))
+        else:
+            result.append((1, p))
+    return result
 
 
 @contextmanager
 def log_conversion_errors(
     first_target_key: str,
-    conversion_errors: MutableMapping[str, str] | None,
+    loading_info: LoadStateDictInfo | None,
     extras: Any = None,
     op: list[ConversionOps] | ConversionOps | None = None,
 ):
     """Catch all exceptions during `convert` calls, and log the errors for later. Re-raise a `SkipParameters` exception
-    that will be catched later to skip the parameters that raised the original Exception."""
+    that will be caught later to skip the parameters that raised the original Exception."""
     try:
         yield
     except Exception as e:
         # During reverse mapping, we do not log and skip errors
-        if conversion_errors is None:
+        if loading_info is None:
             raise e
 
         def _format_op_name(curr_op: list[ConversionOps] | ConversionOps | None) -> str | None:
@@ -847,19 +852,23 @@ def log_conversion_errors(
             return curr_op.__class__.__name__
 
         op_name = _format_op_name(op)
+
+        tb_str = "".join(traceback.format_exception(type(e), e, e.__traceback__))
         if isinstance(extras, tuple) and len(extras) == 2:
             length, target_keys = extras
             descriptor = f"{op_name} " if op_name else ""
-            conversion_errors[first_target_key] = (
-                f"{e}\nError: {descriptor}on tensors destined for {target_keys}. Ckpt contains: {length}"
+            loading_info.conversion_errors[first_target_key] = (
+                f"{tb_str}{e}\nError: {descriptor}on tensors destined for {target_keys}. Ckpt contains: {length}"
             )
         elif isinstance(extras, str):
             suffix = f" via {op_name}" if op_name else ""
-            conversion_errors[first_target_key] = f"{e}\nError{suffix} when processing parameter {extras}"
+            loading_info.conversion_errors[first_target_key] = (
+                f"{tb_str}{e}\nError{suffix} when processing parameter {extras}"
+            )
         elif extras is None and op_name:
-            conversion_errors[first_target_key] = f"{op_name}: {e}"
+            loading_info.conversion_errors[first_target_key] = f"{op_name}: {e}"
         else:
-            conversion_errors[first_target_key] = f"{extras} |Error: {e}"
+            loading_info.conversion_errors[first_target_key] = f"{extras} |Error: {e}"
 
         # Raise a specific Exception that we can catch easily
         raise SkipParameters()
@@ -869,9 +878,7 @@ def set_param_for_module(
     model: PreTrainedModel,
     target_name: str,
     param_value: torch.Tensor,
-    mismatch_keys: MutableSet[tuple[str, torch.Size, torch.Size]],
-    missing_keys: MutableSet[str],
-    unexpected_keys: MutableSet[str],
+    loading_info: LoadStateDictInfo,
     distributed_operation: TensorParallelLayer | None,
     hf_quantizer: HfQuantizer,
 ):
@@ -880,14 +887,14 @@ def set_param_for_module(
 
     ref = getattr(module_obj, param_name)
     if ref is None:
-        unexpected_keys.add(target_name)
+        loading_info.unexpected_keys.add(target_name)
     else:
         if not isinstance(param_value, torch.nn.Parameter):
             if param_name not in module_obj._buffers:
                 param_value = torch.nn.Parameter(param_value, requires_grad=param_value.is_floating_point())
 
         # Remove from missing keys (it's either mismatched, or all good)
-        missing_keys.discard(target_name)
+        loading_info.missing_keys.discard(target_name)
 
         # Determine expected shape: for TP, use sharded shape; otherwise, use full shape
         if distributed_operation is not None:
@@ -896,7 +903,7 @@ def set_param_for_module(
             expected_shape = ref.shape
 
         if ref is not None and param_value.shape != expected_shape and hf_quantizer is None:
-            mismatch_keys.add((target_name, param_value.shape, expected_shape))
+            loading_info.mismatched_keys.add((target_name, param_value.shape, expected_shape))
         else:
             # super important otherwise _init_weight will re-init the param
             param_value._is_hf_initialized = True
@@ -906,7 +913,7 @@ def set_param_for_module(
 def offload_and_maybe_resave_param(
     target_name: str,
     param: torch.Tensor,
-    missing_keys: MutableSet[str],
+    loading_info: LoadStateDictInfo,
     disk_offload_folder: str,
     disk_offload_index: dict,
     applied_ops: WeightConverter | WeightRenaming,
@@ -915,7 +922,7 @@ def offload_and_maybe_resave_param(
     WeightConverter operations have been applied, it will resave the new parameter. Otherwise, it will use the original
     `disk_offload_index` for this given param."""
     # We need to remove from missing keys
-    missing_keys.discard(target_name)
+    loading_info.missing_keys.discard(target_name)
     # If not already offloaded, or if we applied any special Operation except Renaming, we need to re-save
     if target_name not in disk_offload_index or isinstance(applied_ops, WeightConverter):
         disk_offload_index = offload_weight(param, target_name, disk_offload_folder, disk_offload_index)
@@ -938,7 +945,7 @@ def rename_source_key(
 ) -> tuple[str, str | None]:
     """
     Rename a source key given all the renaming and weight conversion patterns we have. Also takes care of adding/removing
-    the base model prefix during loading if necesary.
+    the base model prefix during loading if necessary.
     """
     renamed_key = source_key
     # 1. apply all renamings in turns (if multiple match, it's the responsibility of the mappings to make sure they
@@ -954,7 +961,7 @@ def rename_source_key(
         if source_pattern is not None:
             break
 
-    # 3. check if we need to add or remove prefix if necesary (only during loading, not saving)
+    # 3. check if we need to add or remove prefix if necessary (only during loading, not saving)
     if prefix is not None and meta_state_dict is not None:
         if (
             renamed_key.startswith(prefix)
@@ -970,9 +977,8 @@ def rename_source_key(
 def convert_and_load_state_dict_in_model(
     model: PreTrainedModel,
     state_dict: dict[str, Any],
-    load_config: Any,
+    load_config: LoadStateDictConfig,
     tp_plan: dict[str, str] | None,
-    dtype_plan: dict | None = None,
     disk_offload_index: dict | None = None,
 ):
     r"""
@@ -1069,15 +1075,19 @@ def convert_and_load_state_dict_in_model(
     device_mesh = load_config.device_mesh
     disk_offload_folder = load_config.disk_offload_folder
     offload_buffers = load_config.offload_buffers
-    dtype_plan = dtype_plan or {}
+    dtype_plan = load_config.dtype_plan or {}
     weight_mapping = load_config.weight_mapping or []
     meta_model_state_dict = model.state_dict()
     model_buffers = {k for k, _ in model.named_buffers()}
 
-    missing_keys = set(meta_model_state_dict.keys())
-    conversion_errors = {}
-    mismatch_keys = set()
-    unexpected_keys = set()
+    # We start from all missing keys, and we will remove/add them from the proper containers as loading advances
+    loading_info = LoadStateDictInfo(
+        missing_keys=set(meta_model_state_dict.keys()),
+        unexpected_keys=set(),
+        mismatched_keys=set(),
+        conversion_errors={},
+        error_msgs=[],
+    )
 
     # We use threading by default, if not explicitly deactivated via env variable. If we have to offload,
     # we cannot use it either to control the memory as we are under memory constraints, so we need to be sequential
@@ -1107,7 +1117,7 @@ def convert_and_load_state_dict_in_model(
         )
 
         # 2. finally, collect the tensor into the proper converter
-        if renamed_key in missing_keys:
+        if renamed_key in meta_model_state_dict:
             empty_param = meta_model_state_dict.get(renamed_key)
             # If we enter here, we have a WeightConverter operation to perform
             if source_pattern is not None:
@@ -1150,7 +1160,11 @@ def convert_and_load_state_dict_in_model(
                         mapping.distributed_operation = tp_layer(
                             device_mesh=device_mesh, rank=device_mesh.get_local_rank(), empty_param=empty_param.clone()
                         )
-                    shard_index = len(mapping.collected_tensors.get(original_key, []))
+                    shard_index = (
+                        len(mapping.collected_tensors.get(source_pattern, []))
+                        if isinstance(mapping, WeightConverter) and isinstance(mapping.operations[0], MergeModulelist)
+                        else None
+                    )
                     future_or_tensor = spawn_tp_materialize(
                         thread_pool,
                         tensor,
@@ -1168,9 +1182,9 @@ def convert_and_load_state_dict_in_model(
         elif source_pattern is not None:  # add all target keys as unexpected
             mapping = pattern_to_converter[source_pattern]
             for k in mapping.target_patterns:
-                unexpected_keys.add(renamed_key.replace(mapping.target_patterns[0], k))
+                loading_info.unexpected_keys.add(renamed_key.replace(mapping.target_patterns[0], k))
         else:
-            unexpected_keys.add(renamed_key)
+            loading_info.unexpected_keys.add(renamed_key)
 
     try:
         total_entries = len(param_name_to_load)
@@ -1180,13 +1194,12 @@ def convert_and_load_state_dict_in_model(
                 pbar.set_postfix({"Materializing param": first_param_name})
                 pbar.refresh()
                 try:
-                    realized_value, conversion_errors = mapping.convert(
+                    realized_value = mapping.convert(
                         first_param_name,
                         model=model,
                         config=model.config,
                         hf_quantizer=hf_quantizer,
-                        missing_keys=missing_keys,
-                        conversion_errors=conversion_errors,
+                        loading_info=loading_info,
                     )
                     for target_name, param in realized_value.items():
                         param = param[0] if isinstance(param, list) else param
@@ -1194,16 +1207,14 @@ def convert_and_load_state_dict_in_model(
                         # Offloading support
                         if param_device == "disk" and (target_name not in model_buffers or offload_buffers):
                             disk_offload_index = offload_and_maybe_resave_param(
-                                target_name, param, missing_keys, disk_offload_folder, disk_offload_index, mapping
+                                target_name, param, loading_info, disk_offload_folder, disk_offload_index, mapping
                             )
                         else:
                             set_param_for_module(
                                 model,
                                 target_name,
                                 param,
-                                mismatch_keys,
-                                missing_keys,
-                                unexpected_keys,
+                                loading_info,
                                 mapping.distributed_operation,
                                 hf_quantizer,
                             )
@@ -1217,12 +1228,12 @@ def convert_and_load_state_dict_in_model(
     # Close the pool, independently of whether the code was interrupted or finished successfully
     finally:
         if thread_pool is not None:
-            # `cancel_futures=True` in case the program was interupted, to avoid wasting time on exit
+            # `cancel_futures=True` in case the program was interrupted, to avoid wasting time on exit
             thread_pool.shutdown(wait=False, cancel_futures=True)
 
     # Keep the current weight conversion mapping for later saving (in case it was coming directly from the user)
     model._weight_conversions = weight_mapping
-    return missing_keys, unexpected_keys, mismatch_keys, disk_offload_index, conversion_errors
+    return loading_info, disk_offload_index
 
 
 def revert_weight_conversion(model: PreTrainedModel, state_dict: dict[str, torch.Tensor]):
@@ -1269,7 +1280,7 @@ def revert_weight_conversion(model: PreTrainedModel, state_dict: dict[str, torch
     new_state_dict = {}
     for first_param_name, reversed_converter in conversion_mapping.items():
         # Apply the reverse converter
-        realized_value, _ = reversed_converter.convert(first_param_name, model=model, config=model.config)
+        realized_value = reversed_converter.convert(first_param_name, model=model, config=model.config)
         for target_name, param in realized_value.items():
             param = param[0] if isinstance(param, list) else param
             new_state_dict[target_name] = param
