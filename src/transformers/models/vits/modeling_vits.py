@@ -36,12 +36,12 @@ from .configuration_vits import VitsConfig
 logger = logging.get_logger(__name__)
 
 
-@dataclass
 @auto_docstring(
     custom_intro="""
     Describes the outputs for the VITS model, with potential hidden states and attentions.
     """
 )
+@dataclass
 class VitsModelOutput(ModelOutput):
     r"""
     waveform (`torch.FloatTensor` of shape `(batch_size, sequence_length)`):
@@ -60,12 +60,12 @@ class VitsModelOutput(ModelOutput):
     attentions: tuple[torch.FloatTensor] | None = None
 
 
-@dataclass
 @auto_docstring(
     custom_intro="""
     Describes the outputs for the VITS text encoder model, with potential hidden states and attentions.
     """
 )
+@dataclass
 class VitsTextEncoderOutput(ModelOutput):
     r"""
     prior_means (`torch.FloatTensor` of shape `(batch_size, sequence_length, hidden_size)`):
@@ -1207,24 +1207,12 @@ class VitsPreTrainedModel(PreTrainedModel):
     @torch.no_grad()
     def _init_weights(self, module: nn.Module):
         """Initialize the weights"""
-        std = self.config.initializer_range
-        if isinstance(module, nn.Linear):
-            init.normal_(module.weight, mean=0.0, std=std)
-            if module.bias is not None:
-                init.zeros_(module.bias)
-        elif isinstance(module, nn.LayerNorm):
-            init.zeros_(module.bias)
-            init.ones_(module.weight)
-        elif isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
+        super()._init_weights(module)
+        if isinstance(module, (nn.Conv1d, nn.ConvTranspose1d)):
             init.kaiming_normal_(module.weight)
             if module.bias is not None:
                 k = math.sqrt(module.groups / (module.in_channels * module.kernel_size[0]))
                 init.uniform_(module.bias, a=-k, b=k)
-        elif isinstance(module, nn.Embedding):
-            init.normal_(module.weight, mean=0.0, std=std)
-            # Here we need the check explicitly, as we slice the weight in the `zeros_` call, so it looses the flag
-            if module.padding_idx is not None and not getattr(module.weight, "_is_hf_initialized", False):
-                init.zeros_(module.weight[module.padding_idx])
         elif isinstance(module, VitsAttention):
             if self.config.window_size:
                 head_dim = self.config.hidden_size // self.config.num_attention_heads
@@ -1277,6 +1265,7 @@ class VitsModel(VitsPreTrainedModel):
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
         labels: torch.FloatTensor | None = None,
+        speaking_rate: float | None = None,
         **kwargs,
     ) -> tuple[Any] | VitsModelOutput:
         r"""
@@ -1285,6 +1274,8 @@ class VitsModel(VitsPreTrainedModel):
         labels (`torch.FloatTensor` of shape `(batch_size, config.spectrogram_bins, sequence_length)`, *optional*):
             Float values of target spectrogram. Timesteps set to `-100.0` are ignored (masked) for the loss
             computation.
+        speaking_rate (`float`, *optional*):
+            Speaking rate.
 
         Example:
 
@@ -1309,7 +1300,7 @@ class VitsModel(VitsPreTrainedModel):
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
 
         if labels is not None:
             raise NotImplementedError("Training of VITS is not supported yet.")
@@ -1354,7 +1345,9 @@ class VitsModel(VitsPreTrainedModel):
         else:
             log_duration = self.duration_predictor(hidden_states, input_padding_mask, speaker_embeddings)
 
-        length_scale = 1.0 / self.speaking_rate
+        if speaking_rate is None:
+            speaking_rate = self.speaking_rate
+        length_scale = 1.0 / speaking_rate
         duration = torch.ceil(torch.exp(log_duration) * input_padding_mask * length_scale)
         predicted_lengths = torch.clamp_min(torch.sum(duration, [1, 2]), 1).long()
 

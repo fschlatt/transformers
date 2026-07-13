@@ -18,6 +18,7 @@ from .base import HfQuantizer
 
 if TYPE_CHECKING:
     from ..modeling_utils import PreTrainedModel
+    from ..utils.quantization_config import FbgemmFp8Config
 
 from ..utils import (
     is_accelerate_available,
@@ -43,6 +44,7 @@ class FbgemmFp8HfQuantizer(HfQuantizer):
     """
 
     requires_calibration = False
+    quantization_config: "FbgemmFp8Config"
 
     def __init__(self, quantization_config, **kwargs):
         super().__init__(quantization_config, **kwargs)
@@ -111,7 +113,7 @@ class FbgemmFp8HfQuantizer(HfQuantizer):
     def param_element_size(self, model: "PreTrainedModel", param_name: str, param: "torch.Tensor") -> float:
         "Return the element size (in bytes) for `param_name`."
         if self.param_needs_quantization(model, param_name):
-            # 8 bit, this is neeed as when `pre_quantized`` is False, we don't set the dtype of the FP8Linear in order to correctly load the weights
+            # 8 bit, this is needed as when `pre_quantized`` is False, we don't set the dtype of the FP8Linear in order to correctly load the weights
             return 1
         return super().param_element_size(model, param_name, param)
 

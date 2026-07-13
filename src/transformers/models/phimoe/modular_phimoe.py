@@ -281,6 +281,7 @@ class PhimoeTopKRouter(nn.Linear):
         self.router_jitter_noise = config.router_jitter_noise
         self.input_jitter_noise = config.input_jitter_noise
         self.top_k = config.num_experts_per_tok
+        self.num_experts = config.num_local_experts
 
     def forward(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         if self.training and self.input_jitter_noise > 0:
@@ -367,7 +368,6 @@ class PhimoeForCausalLM(MixtralForCausalLM):
         past_key_values=None,
         attention_mask=None,
         inputs_embeds=None,
-        cache_position=None,
         position_ids=None,
         use_cache=True,
         logits_to_keep=None,
@@ -383,7 +383,7 @@ class PhimoeForCausalLM(MixtralForCausalLM):
             and hasattr(self.config, "original_max_position_embeddings")
             and input_ids.shape[1] >= self.config.original_max_position_embeddings + 1
         ):
-            past_length = cache_position[0]
+            past_length = past_key_values.get_seq_length()
             if past_length <= self.config.original_max_position_embeddings:
                 past_key_values = None
 
@@ -392,7 +392,6 @@ class PhimoeForCausalLM(MixtralForCausalLM):
             past_key_values=past_key_values,
             attention_mask=attention_mask,
             inputs_embeds=inputs_embeds,
-            cache_position=cache_position,
             position_ids=position_ids,
             use_cache=use_cache,
             logits_to_keep=logits_to_keep,

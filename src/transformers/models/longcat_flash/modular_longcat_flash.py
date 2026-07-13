@@ -36,10 +36,10 @@ from ..deepseek_v3.modeling_deepseek_v3 import (
     DeepseekV3Model,
     DeepseekV3RMSNorm,
     DeepseekV3RotaryEmbedding,
-    DeepseekV3TopkRouter,
     apply_rotary_pos_emb_interleave,
     eager_attention_forward,
 )
+from ..mixtral.modeling_mixtral import MixtralTopKRouter
 from .configuration_longcat_flash import LongcatFlashConfig
 
 
@@ -54,28 +54,18 @@ class LongcatFlashRotaryEmbedding(DeepseekV3RotaryEmbedding):
     pass
 
 
-# TODO remap config key ffn_hidden_size -> intermediate_size
 class LongcatFlashMLP(DeepseekV3MLP):
-    def __init__(self, config, hidden_size=None, intermediate_size=None):
-        super().__init__(config)
-        self.hidden_size = config.hidden_size if hidden_size is None else hidden_size
-        self.intermediate_size = config.ffn_hidden_size if intermediate_size is None else intermediate_size
+    pass
 
 
-# TODO remap config key moe_topk -> num_experts_per_tok
-class LongcatFlashTopkRouter(DeepseekV3TopkRouter):
+class LongcatFlashTopkRouter(MixtralTopKRouter):
     def __init__(self, config):
         super().__init__(config)
-        del self.n_group
-        del self.topk_group
-        del self.weight
-        del self.norm_topk_prob
-
-        self.top_k = config.moe_topk
+        del self.weight  # longcat routes through `classifier` (an nn.Linear) instead of a weight Parameter
         self.n_routed_experts = config.n_routed_experts + (config.zero_expert_num or 0)
         self.routed_scaling_factor = config.routed_scaling_factor
-        self.register_buffer("e_score_correction_bias", torch.zeros(self.n_routed_experts))
         self.router_bias = getattr(config, "router_bias", False)
+        self.register_buffer("e_score_correction_bias", torch.zeros(self.n_routed_experts))
         self.classifier = nn.Linear(config.hidden_size, self.n_routed_experts, bias=self.router_bias)
 
     @torch.no_grad()
@@ -85,7 +75,7 @@ class LongcatFlashTopkRouter(DeepseekV3TopkRouter):
         return topk_indices
 
     def forward(self, hidden_states):
-        hidden_states = hidden_states.view(-1, self.config.hidden_size)
+        hidden_states = hidden_states.view(-1, self.hidden_dim)
         router_logits = F.linear(hidden_states.type(torch.float32), self.classifier.weight.type(torch.float32))
         scores = router_logits.softmax(dim=-1)
         topk_indices = self.get_topk_indices(scores)
@@ -103,6 +93,7 @@ class LongcatFlashExperts(nn.Module):
         self.zero_expert_num = config.zero_expert_num or 0
         self.total_experts = self.num_routed_experts + self.zero_expert_num
         self.act_fn = ACT2FN[config.hidden_act]
+        self.identity_expert = nn.Identity()
 
         if self.num_routed_experts > 0:
             self.gate_up_proj = nn.Parameter(
@@ -131,7 +122,7 @@ class LongcatFlashExperts(nn.Module):
             current_state = hidden_states[token_idx]
 
             if expert_idx >= self.num_routed_experts or self.gate_up_proj is None:
-                current_hidden_states = current_state
+                current_hidden_states = self.identity_expert(current_state)
             else:
                 gate, up = F.linear(current_state, self.gate_up_proj[expert_idx]).chunk(2, dim=-1)
                 current_hidden_states = self.act_fn(gate) * up
@@ -177,7 +168,6 @@ class LongcatFlashMLA(DeepseekV3Attention):
         position_embeddings: tuple[torch.Tensor, torch.Tensor],
         attention_mask: torch.Tensor | None,
         past_key_values: Cache | None = None,
-        cache_position: torch.LongTensor | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> tuple[torch.Tensor, torch.Tensor | None, tuple[torch.Tensor] | None]:
         batch_size, seq_length = hidden_states.shape[:-1]
@@ -210,9 +200,7 @@ class LongcatFlashMLA(DeepseekV3Attention):
         key_states = torch.cat((k_pass, k_rot), dim=-1)
 
         if past_key_values is not None:
-            # sin and cos are specific to RoPE models; cache_position needed for the static cache
-            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx)
 
         if is_flash_attention_requested(self.config) and self.qk_head_dim != self.v_head_dim:
             value_states = F.pad(value_states, [0, self.qk_head_dim - self.v_head_dim])
@@ -273,7 +261,6 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         use_cache: bool | None = False,
-        cache_position: torch.LongTensor | None = None,
         position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs: Unpack[FlashAttentionKwargs],
     ) -> torch.Tensor:
@@ -286,7 +273,6 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -309,7 +295,6 @@ class LongcatFlashDecoderLayer(GradientCheckpointingLayer):
             position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
-            cache_position=cache_position,
             position_embeddings=position_embeddings,
             **kwargs,
         )
@@ -341,6 +326,9 @@ class LongcatFlashPreTrainedModel(PreTrainedModel):
         "attentions": LongcatFlashMLA,
     }
     _keys_to_ignore_on_load_unexpected = [r"model\.mtp.*"]
+    _keep_in_fp32_modules = [
+        "classifier.weight"
+    ]  # TODO let's make sure original code base has this, for now it fixes quantization
 
     @torch.no_grad()
     def _init_weights(self, module):
@@ -378,7 +366,6 @@ class LongcatFlashModel(DeepseekV3Model):
         position_ids: torch.LongTensor | None = None,
         past_key_values: Cache | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
-        cache_position: torch.LongTensor | None = None,
         use_cache: bool | None = None,
         **kwargs: Unpack[TransformersKwargs],
     ):
@@ -391,20 +378,15 @@ class LongcatFlashModel(DeepseekV3Model):
         if use_cache and past_key_values is None:
             past_key_values = DynamicCache(config=self.config)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position: torch.Tensor = (
-                torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
-            )
-
         if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            position_ids = torch.arange(inputs_embeds.shape[1], device=inputs_embeds.device) + past_seen_tokens
+            position_ids = position_ids.unsqueeze(0)
 
         causal_mask = create_causal_mask(
             config=self.config,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
-            cache_position=cache_position,
             past_key_values=past_key_values,
             position_ids=position_ids,
         )
@@ -418,7 +400,6 @@ class LongcatFlashModel(DeepseekV3Model):
                 attention_mask=causal_mask,
                 position_ids=position_ids,
                 past_key_values=past_key_values,
-                cache_position=cache_position,
                 position_embeddings=position_embeddings,
                 **kwargs,
             )

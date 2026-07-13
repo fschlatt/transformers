@@ -21,6 +21,7 @@ from ...backbone_utils import BackboneMixin
 from ...modeling_outputs import BackboneOutput
 from ...modeling_utils import PreTrainedModel
 from ...utils import is_timm_available, requires_backends
+from ...utils.generic import can_return_tuple
 from .configuration_timm_backbone import TimmBackboneConfig
 
 
@@ -103,6 +104,7 @@ class TimmBackbone(BackboneMixin, PreTrainedModel):
         timm.utils.model.unfreeze_batch_norm_2d(self._backbone)
 
     @torch.no_grad()
+    # trf-ignore: TRF018
     def _init_weights(self, module):
         """We need to at least re-init the non-persistent buffers if the model was initialized on meta device (we
         assume weights and persistent buffers will be part of checkpoint as we have no way to control timm inits)"""
@@ -116,6 +118,7 @@ class TimmBackbone(BackboneMixin, PreTrainedModel):
                 init.ones_(module.running_var)
                 init.zeros_(module.num_batches_tracked)
 
+    @can_return_tuple
     def forward(
         self,
         pixel_values: torch.FloatTensor,
@@ -124,7 +127,7 @@ class TimmBackbone(BackboneMixin, PreTrainedModel):
         return_dict: bool | None = None,
         **kwargs,
     ) -> BackboneOutput | tuple[Tensor, ...]:
-        return_dict = return_dict if return_dict is not None else self.config.use_return_dict
+        return_dict = return_dict if return_dict is not None else self.config.return_dict
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
